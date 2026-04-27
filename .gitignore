@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+.vs/
+*.user
+*.suo
+배포/GGO_Settings/
+sg_*.py
+_ref/
+Backup/
+CA_SG_Ref/
+Master_Code/
+Boss Finder/
+꼬전용/
+*.bak
+*BACKUP*
+HANDOFF.md
+GGO_UPDATE_WORKFLOW.md
+test_pet_context_menu.py
