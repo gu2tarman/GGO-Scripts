@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from System.Diagnostics import Process, ProcessStartInfo
 from System.IO import Directory, File
 from System.Net import WebClient
 from System.Text import Encoding
@@ -11,21 +12,31 @@ import time
 
 SCRIPT_ID = "GGO_UPDATE_MANAGER"
 SCRIPT_NAME = "GGO_업데이트매니저"
-CURRENT_VERSION = "1.0"
+CURRENT_VERSION = "1.1"
 MANAGER_VERSION = CURRENT_VERSION
 MANAGER_FILE = "GGO_업데이트매니저.py"
 MANIFEST_URL = "https://raw.githubusercontent.com/gu2tarman/GGO-Scripts/main/%EB%B0%B0%ED%8F%AC/GGO_update_manifest.json"
+SUPPORT_DISCORD_URL = "http://uomargo.net"
+SUPPORT_WEBHOOK_URL = "https://discord.gg/KQzHZsZ9eH"
+SUPPORT_KAKAO_URL = "https://open.kakao.com/o/sA71kz5d"
 ITEMS_PER_PAGE = 6
 DEBUG_LOG = False
 GUMP_ID = 0x47475501
 NOTES_GUMP_ID = 0x47475502
+SUPPORT_GUMP_ID = 0x47475503
 BTN_UPDATE_ALL = 9001
-BTN_REFRESH = 9002
+BTN_OTHER_SCRIPTS = 9002
 BTN_CLOSE = 9003
 BTN_NOTES = 9004
 BTN_NOTES_CLOSE = 9005
 BTN_PREV_PAGE = 9006
 BTN_NEXT_PAGE = 9007
+BTN_SUPPORT = 9008
+BTN_SUPPORT_DISCORD = 9009
+BTN_SUPPORT_WEBHOOK = 9010
+BTN_SUPPORT_KAKAO = 9011
+BTN_SUPPORT_BACK = 9012
+BTN_UPDATE_LIST = 9013
 BTN_ITEM_BASE = 9100
 
 
@@ -139,18 +150,37 @@ def add_center_label(gd, x, y, width, color_hex, text):
 
 def wait_gump_button(gump_id):
     while True:
-        Misc.Pause(100)
+        Gumps.WaitForGump(gump_id, 60000)
         data = Gumps.GetGumpData(gump_id)
-        if data and data.buttonid > 0:
-            button_id = data.buttonid
-            Gumps.SendAction(gump_id, 0)
-            Gumps.CloseGump(gump_id)
-            return button_id
+        if data is None:
+            continue
+        button_id = data.buttonid
+        if button_id == 0:
+            return BTN_CLOSE
+        Gumps.SendAction(gump_id, 0)
+        Gumps.CloseGump(gump_id)
+        return button_id
+
+
+def open_url(url, label):
+    if not url:
+        ggo_msg("{0} 링크가 아직 설정되지 않았습니다.".format(label), 33)
+        return False
+    try:
+        psi = ProcessStartInfo()
+        psi.FileName = url
+        psi.UseShellExecute = True
+        Process.Start(psi)
+        ggo_msg("{0} 링크를 열었습니다.".format(label), 68)
+        return True
+    except Exception as error:
+        ggo_msg("{0} 링크 열기 실패: {1}".format(label, error), 33)
+        ggo_msg(url, 90)
+        return False
 
 
 def make_backup(path, base_dir):
     if not File.Exists(path):
-        ggo_msg("backup skipped, file not found: {0}".format(path), 33)
         return None
 
     backup_dir = os.path.join(base_dir, "_ggo_update_backup")
@@ -207,37 +237,55 @@ def notify_manager_updated():
 
 
 def collect_update_info(base_dir, scripts):
-    all_items = []
+    installed_items = []
     update_items = []
+    install_items = []
 
     for entry in scripts:
         local_file = entry.get("local_file", "")
         display_name = entry.get("name", local_file)
         local_path = os.path.join(base_dir, local_file)
-        local_version = get_local_version(local_path)
+        installed = File.Exists(local_path)
+        local_version = get_local_version(local_path) if installed else "0.0"
         latest_version = entry.get("version", "0.0")
-        needs_update = version_tuple(latest_version) > version_tuple(local_version)
+        needs_update = installed and version_tuple(latest_version) > version_tuple(local_version)
+        needs_install = (not installed) and entry.get("discoverable", True)
 
         item = {
             "entry": entry,
             "name": display_name,
+            "installed": installed,
             "local_version": local_version,
             "latest_version": latest_version,
             "notes": entry.get("notes", ""),
             "needs_update": needs_update,
+            "needs_install": needs_install,
         }
         if needs_update:
-            item["update_index"] = len(update_items)
             update_items.append(item)
-        all_items.append(item)
+        if needs_install:
+            install_items.append(item)
+        if installed:
+            installed_items.append(item)
 
-        debug_msg("{0}: local v{1} / remote v{2}".format(display_name, local_version, latest_version), 68)
+        local_label = local_version if installed else "not installed"
+        debug_msg("{0}: local {1} / remote v{2}".format(display_name, local_label, latest_version), 68)
 
-    all_items.sort(key=lambda item: 0 if item["needs_update"] else 1)
-    return all_items, update_items
+    installed_items.sort(key=lambda item: 0 if item["needs_update"] else 1)
+    install_items.sort(key=lambda item: item["name"])
+    return installed_items, update_items, install_items
 
 
-def show_update_gump(all_items, update_items, current_page):
+def get_action_items(display_items):
+    action_items = []
+    for item in display_items:
+        if item.get("needs_update", False) or item.get("needs_install", False):
+            item["action_index"] = len(action_items)
+            action_items.append(item)
+    return action_items
+
+
+def show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode):
     try:
         Gumps.CloseGump(GUMP_ID)
         gd = Gumps.CreateGump(movable=True)
@@ -247,12 +295,12 @@ def show_update_gump(all_items, update_items, current_page):
         version_x = 318
         action_x = 420
         action_w = 120
-        total_pages = get_total_pages(len(all_items))
-        current_page = clamp_page(current_page, len(all_items))
+        total_pages = get_total_pages(len(display_items))
+        current_page = clamp_page(current_page, len(display_items))
 
         start_index = current_page * ITEMS_PER_PAGE
         end_index = start_index + ITEMS_PER_PAGE
-        page_items = all_items[start_index:end_index]
+        page_items = display_items[start_index:end_index]
 
         height = 150 + max(len(page_items), 1) * row_height
         if total_pages > 1:
@@ -266,10 +314,18 @@ def show_update_gump(all_items, update_items, current_page):
         Gumps.AddLabel(gd, 15, 12, 53, "GGO Update Manager v{0}".format(MANAGER_VERSION))
         Gumps.AddImageTiled(gd, 10, 33, width - 20, 2, 9107)
 
-        if update_items:
-            Gumps.AddLabel(gd, 15, 45, 90, "업데이트 가능: {0}개".format(len(update_items)))
+        if view_mode == "install":
+            if install_items:
+                Gumps.AddLabel(gd, 15, 45, 90, "다른 스크립트: {0}개".format(len(install_items)))
+            else:
+                Gumps.AddLabel(gd, 15, 45, 68, "설치 가능한 다른 스크립트가 없습니다.")
         else:
-            Gumps.AddLabel(gd, 15, 45, 68, "모든 파일이 최신 버전입니다.")
+            if update_items:
+                Gumps.AddLabel(gd, 15, 45, 90, "업데이트 가능: {0}개".format(len(update_items)))
+            else:
+                Gumps.AddLabel(gd, 15, 45, 68, "설치된 파일이 최신 버전입니다.")
+            if install_items:
+                Gumps.AddLabel(gd, 205, 45, 53, "다른 스크립트 {0}개".format(len(install_items)))
 
         if total_pages > 1:
             add_center_label(gd, 420, 45, 120, "DDDDDD", "{0} / {1}".format(current_page + 1, total_pages))
@@ -281,32 +337,39 @@ def show_update_gump(all_items, update_items, current_page):
 
         y = 106
         for item in page_items:
-            hue = 90 if item["needs_update"] else 68
+            hue = 90 if (item["needs_update"] or item["needs_install"]) else 68
             notes = primary_note(item.get("notes", ""))
             name = short_text(item["name"], 28)
 
             Gumps.AddLabel(gd, file_x, y, hue, name)
             if item["needs_update"]:
-                button_id = BTN_ITEM_BASE + item["update_index"]
+                button_id = BTN_ITEM_BASE + item["action_index"]
                 add_center_label(gd, version_x - 10, y + 1, 90, "99DDFF", "v{0} -> v{1}".format(item["local_version"], item["latest_version"]))
                 Gumps.AddButton(gd, action_x, y - 2, 40030, 40031, button_id, 1, 0)
                 add_center_label(gd, action_x, y + 1, action_w, "FFFFFF", "업데이트")
+            elif item["needs_install"]:
+                button_id = BTN_ITEM_BASE + item["action_index"]
+                add_center_label(gd, version_x - 10, y + 1, 90, "99DDFF", "미설치 -> v{0}".format(item["latest_version"]))
+                Gumps.AddButton(gd, action_x, y - 2, 40030, 40031, button_id, 1, 0)
+                add_center_label(gd, action_x, y + 1, action_w, "FFFFFF", "설치")
             else:
                 add_center_label(gd, version_x - 10, y + 1, 90, "88FF88", "v{0} 최신".format(item["local_version"]))
                 add_center_label(gd, action_x, y + 1, action_w, "88FF88", "완료")
-            if item["needs_update"] and notes:
+            if (item["needs_update"] or item["needs_install"]) and notes:
                 Gumps.AddLabel(gd, file_x, y + 25, 1152, "주요 변경: {0}".format(notes))
             Gumps.AddImageTiled(gd, 15, y + row_height - 8, width - 30, 1, 9107)
             y += row_height
 
         bottom_y = height - 35
         nav_y = bottom_y - 28
-        if update_items:
-            Gumps.AddButton(gd, 15, bottom_y, 40030, 40031, BTN_UPDATE_ALL, 1, 0)
+        Gumps.AddButton(gd, 15, bottom_y, 40030, 40031, BTN_UPDATE_ALL, 1, 0)
+        if view_mode == "install":
+            add_center_label(gd, 15, bottom_y + 2, action_w, "FFFFFF", "전체 설치")
+        else:
             add_center_label(gd, 15, bottom_y + 2, action_w, "FFFFFF", "전체 업데이트")
 
-            Gumps.AddButton(gd, 150, bottom_y, 40021, 40022, BTN_NOTES, 1, 0)
-            add_center_label(gd, 150, bottom_y + 2, action_w, "FFFFFF", "패치노트")
+        Gumps.AddButton(gd, 150, bottom_y, 40021, 40022, BTN_NOTES, 1, 0)
+        add_center_label(gd, 150, bottom_y + 2, action_w, "FFFFFF", "패치노트")
 
         if total_pages > 1 and current_page > 0:
             Gumps.AddButton(gd, 285, nav_y, 40021, 40022, BTN_PREV_PAGE, 1, 0)
@@ -316,11 +379,15 @@ def show_update_gump(all_items, update_items, current_page):
             Gumps.AddButton(gd, 420, nav_y, 40021, 40022, BTN_NEXT_PAGE, 1, 0)
             add_center_label(gd, 420, nav_y + 2, action_w, "FFFFFF", "다음")
 
-        Gumps.AddButton(gd, 285, bottom_y, 40021, 40022, BTN_REFRESH, 1, 0)
-        add_center_label(gd, 285, bottom_y + 2, action_w, "FFFFFF", "다시 확인")
+        if view_mode == "install":
+            Gumps.AddButton(gd, 285, bottom_y, 40021, 40022, BTN_UPDATE_LIST, 1, 0)
+            add_center_label(gd, 285, bottom_y + 2, action_w, "FFFFFF", "업데이트 목록")
+        else:
+            Gumps.AddButton(gd, 285, bottom_y, 40021, 40022, BTN_OTHER_SCRIPTS, 1, 0)
+            add_center_label(gd, 285, bottom_y + 2, action_w, "FFFFFF", "다른 스크립트")
 
-        Gumps.AddButton(gd, 420, bottom_y, 40297, 40298, BTN_CLOSE, 1, 0)
-        add_center_label(gd, 420, bottom_y + 2, action_w, "FFFFFF", "닫기")
+        Gumps.AddButton(gd, 420, bottom_y, 40021, 40022, BTN_SUPPORT, 1, 0)
+        add_center_label(gd, 420, bottom_y + 2, action_w, "FFFFFF", "문의&지원")
 
         Gumps.SendGump(GUMP_ID, Player.Serial, 120, 120, gd.gumpDefinition, gd.gumpStrings)
         return True
@@ -371,6 +438,57 @@ def show_notes_gump(update_items):
         ggo_msg("patch notes gump failed: {0}".format(error), 33)
 
 
+def show_support_gump():
+    try:
+        Gumps.CloseGump(SUPPORT_GUMP_ID)
+        gd = Gumps.CreateGump(movable=True)
+        width = 430
+        height = 210
+        button_x = 20
+        label_x = 155
+
+        Gumps.AddPage(gd, 0)
+        Gumps.AddBackground(gd, 0, 0, width, height, 30546)
+        Gumps.AddAlphaRegion(gd, 0, 0, width, height)
+        Gumps.AddLabel(gd, 15, 12, 53, "GGO 문의 & 지원")
+        Gumps.AddImageTiled(gd, 10, 33, width - 20, 2, 9107)
+
+        Gumps.AddButton(gd, button_x, 52, 40021, 40022, BTN_SUPPORT_DISCORD, 1, 0)
+        add_center_label(gd, button_x, 54, 120, "FFFFFF", "마고 홈피")
+        Gumps.AddLabel(gd, label_x, 55, 1152, "마고 서버 홈페이지")
+
+        Gumps.AddButton(gd, button_x, 88, 40021, 40022, BTN_SUPPORT_WEBHOOK, 1, 0)
+        add_center_label(gd, button_x, 90, 120, "FFFFFF", "웹훅 발급소")
+        Gumps.AddLabel(gd, label_x, 91, 1152, "알림 기능용 Discord 웹훅 생성")
+
+        Gumps.AddButton(gd, button_x, 124, 40021, 40022, BTN_SUPPORT_KAKAO, 1, 0)
+        add_center_label(gd, button_x, 126, 120, "FFFFFF", "카카오톡 1:1")
+        Gumps.AddLabel(gd, label_x, 127, 1152, "각종 문의, 건의 및 제보")
+
+        Gumps.AddButton(gd, 290, height - 35, 40297, 40298, BTN_SUPPORT_BACK, 1, 0)
+        add_center_label(gd, 290, height - 33, 120, "FFFFFF", "뒤로")
+        Gumps.SendGump(SUPPORT_GUMP_ID, Player.Serial, 170, 150, gd.gumpDefinition, gd.gumpStrings)
+
+        while True:
+            button_id = wait_gump_button(SUPPORT_GUMP_ID)
+            if button_id == BTN_SUPPORT_DISCORD:
+                open_url(SUPPORT_DISCORD_URL, "마고 홈피")
+                show_support_gump()
+                return
+            if button_id == BTN_SUPPORT_WEBHOOK:
+                open_url(SUPPORT_WEBHOOK_URL, "웹훅 발급소")
+                show_support_gump()
+                return
+            if button_id == BTN_SUPPORT_KAKAO:
+                open_url(SUPPORT_KAKAO_URL, "카카오톡 1:1")
+                show_support_gump()
+                return
+            if button_id == BTN_SUPPORT_BACK:
+                return
+    except Exception as error:
+        ggo_msg("support gump failed: {0}".format(error), 33)
+
+
 def apply_selected_updates(update_items, selected_indexes, base_dir):
     updated_count = 0
     failed_count = 0
@@ -412,9 +530,12 @@ def run_manager():
         ggo_msg("no managed scripts in manifest", 33)
         return
 
-    all_items, update_items = collect_update_info(base_dir, scripts)
+    installed_items, update_items, install_items = collect_update_info(base_dir, scripts)
+    view_mode = "update"
     current_page = 0
-    if not show_update_gump(all_items, update_items, current_page):
+    display_items = installed_items
+    action_items = get_action_items(display_items)
+    if not show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode):
         return
 
     while True:
@@ -424,44 +545,65 @@ def run_manager():
             ggo_msg("manager closed", 68)
             return
 
-        if button_id == BTN_REFRESH:
-            run_manager()
-            return
-
         if button_id == BTN_NOTES:
-            show_notes_gump(update_items)
-            show_update_gump(all_items, update_items, current_page)
+            show_notes_gump(action_items)
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
+            continue
+
+        if button_id == BTN_SUPPORT:
+            show_support_gump()
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
+            continue
+
+        if button_id == BTN_OTHER_SCRIPTS:
+            view_mode = "install"
+            current_page = 0
+            display_items = install_items
+            action_items = get_action_items(display_items)
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
+            continue
+
+        if button_id == BTN_UPDATE_LIST:
+            view_mode = "update"
+            current_page = 0
+            display_items = installed_items
+            action_items = get_action_items(display_items)
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
             continue
 
         if button_id == BTN_PREV_PAGE:
             current_page -= 1
-            show_update_gump(all_items, update_items, current_page)
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
             continue
 
         if button_id == BTN_NEXT_PAGE:
             current_page += 1
-            show_update_gump(all_items, update_items, current_page)
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
             continue
 
         if button_id == BTN_UPDATE_ALL:
-            manager_updated = apply_selected_updates(update_items, range(len(update_items)), base_dir)
+            manager_updated = apply_selected_updates(action_items, range(len(action_items)), base_dir)
             if manager_updated:
                 notify_manager_updated()
                 return
-            all_items, update_items = collect_update_info(base_dir, scripts)
-            current_page = clamp_page(current_page, len(all_items))
-            show_update_gump(all_items, update_items, current_page)
+            installed_items, update_items, install_items = collect_update_info(base_dir, scripts)
+            display_items = install_items if view_mode == "install" else installed_items
+            action_items = get_action_items(display_items)
+            current_page = clamp_page(current_page, len(display_items))
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
             continue
 
         if button_id >= BTN_ITEM_BASE:
             selected_index = button_id - BTN_ITEM_BASE
-            manager_updated = apply_selected_updates(update_items, [selected_index], base_dir)
+            manager_updated = apply_selected_updates(action_items, [selected_index], base_dir)
             if manager_updated:
                 notify_manager_updated()
                 return
-            all_items, update_items = collect_update_info(base_dir, scripts)
-            current_page = clamp_page(current_page, len(all_items))
-            show_update_gump(all_items, update_items, current_page)
+            installed_items, update_items, install_items = collect_update_info(base_dir, scripts)
+            display_items = install_items if view_mode == "install" else installed_items
+            action_items = get_action_items(display_items)
+            current_page = clamp_page(current_page, len(display_items))
+            show_update_gump(display_items, action_items, update_items, install_items, current_page, view_mode)
             continue
 
         Misc.Pause(200)

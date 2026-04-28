@@ -5,10 +5,10 @@
       "id": "GGO_UPDATE_MANAGER",
       "name": "GGO_업데이트매니저",
       "local_file": "GGO_업데이트매니저.py",
-      "version": "1.0",
+      "version": "1.1",
       "managed": true,
       "url": "https://raw.githubusercontent.com/gu2tarman/GGO-Scripts/main/%EB%B0%B0%ED%8F%AC/latest/GGO_%EC%97%85%EB%8D%B0%EC%9D%B4%ED%8A%B8%EB%A7%A4%EB%8B%88%EC%A0%80.py",
-      "notes": "업데이트매니저 자체 업데이트 지원; 업데이트 후 RE 스크립트 목록 리프레시 및 재실행 필요"
+      "notes": "다른 스크립트 보기/설치 및 문의&지원 링크 검프 추가; 업데이트 후 RE 스크립트 목록 리프레시 및 재실행 필요"
     },
     {
       "id": "GGO_USER_CONFIG",
