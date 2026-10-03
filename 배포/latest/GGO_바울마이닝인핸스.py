@@ -2,14 +2,14 @@
 
 
 # =============================================================================
-# [GGO Project] 바울 마이닝 인핸스 (Baul Mining Enhance) v1.7
+# [GGO Project] 바울 마이닝 인핸스 (Baul Mining Enhance) v1.8
 # =============================================================================
 # 원작자의 소중한 소스코드를 기반으로 GGO Project에서 기능적인 개선을 시도한 버전입니다.
 # =============================================================================
 
 SCRIPT_ID = "GGO_MINING"
 SCRIPT_NAME = "GGO_바울마이닝인핸스"
-CURRENT_VERSION = "1.7"
+CURRENT_VERSION = "1.8"
 
 import os, sys
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +33,7 @@ import time
 import json
 import ctypes
 import traceback
+import re
 
 class _SettingsEdit(Exception):
     """채집 호출 스택을 끝낸 뒤 설정 편집으로 진입한다."""
@@ -900,6 +901,51 @@ def weighthome(force=False):
         oremove()
         trim_working_set()
 
+def _craft_reply(layout, strings, names, category=False):
+    """현재 제작 검프에서 이름과 같은 행의 제작 버튼을 찾는다."""
+    cliloc_names = {1044046: 'Tools', 1023898: 'shovel', 1044164: 'tinker tools'}
+    normalize = lambda value: re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', '', value)).strip().lower()
+    wanted = set(normalize(name) for name in names)
+    page, buttons, labels = 0, [], []
+    for raw in re.findall(r'\{([^{}]*)\}', layout):
+        fields = raw.split()
+        if not fields: continue
+        try:
+            kind = fields[0]
+            if kind == 'page':
+                page = int(fields[1])
+            elif kind == 'button' and int(fields[5]) == 1 and int(fields[7]) > 0:
+                buttons.append((page, int(fields[1]), int(fields[2]), int(fields[7])))
+            elif kind in ('text', 'croppedtext', 'htmlgump'):
+                index = int(fields[4] if kind == 'text' else fields[6] if kind == 'croppedtext' else fields[5])
+                labels.append((page, int(fields[1]), int(fields[2]), str(strings[index])))
+            elif kind.startswith('xmfhtml'):
+                number = int(fields[8] if kind == 'xmfhtmltok' else fields[5])
+                labels.append((page, int(fields[1]), int(fields[2]), cliloc_names.get(number, '')))
+        except (ValueError, IndexError):
+            continue
+    matches = []
+    for label_page, x, y, text in labels:
+        if normalize(text) not in wanted: continue
+        if category and x >= 200: continue
+        if not category and not 200 <= x <= 450: continue
+        row = [reply for button_page, bx, by, reply in buttons
+               if button_page in (0, label_page) and abs(by - y) <= 4 and 0 < x - bx <= 60]
+        if len(row) == 1: matches.append(row[0])
+    return matches[0] if len(matches) == 1 else None
+
+def _send_named_craft(names, category=False):
+    gump_id = 0x38920abd
+    data = Gumps.GetGumpData(gump_id)
+    if data is None: return False
+    strings = [str(value) for value in data.stringList] if data.stringList is not None else []
+    reply = _craft_reply(str(Gumps.GetGumpRawLayout(gump_id)), strings, names, category)
+    if reply is None:
+        Player.HeadMessage(33, '제작 검프에서 {0} 항목을 찾지 못했습니다.'.format(names[-1]))
+        return False
+    Gumps.SendAction(gump_id, reply)
+    return True
+
 def shovelcheck():
     if not Player.Backpack: return
     while Items.BackpackCount(shovel, 0x0000) < 2:
@@ -910,8 +956,8 @@ def shovelcheck():
             return
         if not toolkits: return
         Items.UseItem(toolkits); UIPause(500)
-        UIWaitForGump(0x38920abd, 2500); Gumps.SendAction(0x38920abd, 15)
-        UIWaitForGump(0x38920abd, 2500); Gumps.SendAction(0x38920abd, 72); UIPause(2000); Gumps.CloseGump(0x38920abd)
+        UIWaitForGump(0x38920abd, 2500); _send_named_craft(('Tools', '도구'), True)
+        UIWaitForGump(0x38920abd, 2500); _send_named_craft(('shovel', '삽')); UIPause(2000); Gumps.CloseGump(0x38920abd)
 
 def toolkitcreate():
     if not Player.Backpack: return
@@ -920,8 +966,8 @@ def toolkitcreate():
         toolkits = Items.FindByID(toolkit, -1, Player.Backpack.Serial)
         if toolkits != None:
             Items.UseItem(toolkits); UIPause(500)
-            UIWaitForGump(0x38920abd, 2500); Gumps.SendAction(0x38920abd, 15)
-            UIWaitForGump(0x38920abd, 2500); Gumps.SendAction(0x38920abd, 23)
+            UIWaitForGump(0x38920abd, 2500); _send_named_craft(('Tools', '도구'), True)
+            UIWaitForGump(0x38920abd, 2500); _send_named_craft(('tinker tools', "tinker's tools", '팅커 도구'))
             UIPause(1500); Gumps.CloseGump(0x38920abd)
         else:
             ResourceWait(500)  # 도구가 공급될 때까지 대기하며 설정 입력 처리
