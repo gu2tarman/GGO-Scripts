@@ -2,7 +2,7 @@
 
 
 # =============================================================================
-# [GGO Project] 바울 럼버 인핸스 (Baul Lumber Enhance) v1.9
+# [GGO Project] 바울 럼버 인핸스 (Baul Lumber Enhance) v2.0
 # =============================================================================
 #
 # 원작자의 소중한 소스코드를 기반으로 GGO Project에서 기능적인 개선을 완료한 버전입니다.
@@ -10,7 +10,7 @@
 
 SCRIPT_ID = "GGO_LUMBER"
 SCRIPT_NAME = "GGO_바울럼버인핸스"
-CURRENT_VERSION = "1.9"
+CURRENT_VERSION = "2.0"
 
 import os
 import sys
@@ -34,6 +34,7 @@ from System.Text import Encoding
 from System.Threading import Thread, ThreadStart
 import time
 import json
+import re
 import traceback
 import ctypes
 
@@ -60,6 +61,7 @@ WATCHDOG_RESTART_DELAY = 20  # 재시작 전 대기 시간 (초)
 USE_MAGERY = False           # True: 마법 리콜 사용, False: 기사도 세이크리드 저니 (기본) - ★ 체력 회복 마법 종류에도 연동됨
 SPELL_CHANNELING = True      # True: 주문전달 도끼 사용 (기본), False: 도끼 탈착 후 캐스팅 (힐링 시에도 연동)
 SKIP_ON_DANGER = True        # True: 적 감지 시 현재 룬북 스킵 (기본)
+MERCENARY_MODE = False       # True: 용병 동행(팔로워 3칸 이상) 시 침공 기간 외에는 적을 무시하고 채집
 MONSTER_REPORT_MODE = 1  # 1: 종료 시 요약 보고, 0: 실시간 개별 보고
 ADJACENT_DANGER_RADIUS = 20 # [v1.6.4 신규] 보고서에 표시할 인접 위험 룬의 탐지 반경 (칸 수)
 
@@ -75,6 +77,7 @@ LUMBER_SCRIPT_SETTINGS_DEFAULTS = {
     "monster_report_mode": MONSTER_REPORT_MODE,
     "adjacent_danger_radius": ADJACENT_DANGER_RADIUS,
     "skip_on_danger": SKIP_ON_DANGER,
+    "mercenary_mode": MERCENARY_MODE,
     "spell_channeling": SPELL_CHANNELING,
     "use_magery": USE_MAGERY,
     "watchdog_restart_delay": WATCHDOG_RESTART_DELAY,
@@ -87,6 +90,7 @@ LUMBER_SCRIPT_SETTINGS_ORDER = [
     "monster_report_mode",
     "adjacent_danger_radius",
     "skip_on_danger",
+    "mercenary_mode",
     "spell_channeling",
     "use_magery",
     "watchdog_restart_delay",
@@ -98,7 +102,7 @@ LUMBER_SCRIPT_SETTINGS_GUIDE = """GGO_바울럼버인핸스 script_settings.json
 이 파일은 업데이트되어도 유지되는 럼버 운용 설정입니다.
 값을 바꾼 뒤 럼버 스크립트를 다시 실행하면 적용됩니다.
 
-use_wood_storage / bod_collect / spell_channeling / use_magery / skip_on_danger는
+use_wood_storage / bod_collect / spell_channeling / use_magery / skip_on_danger / mercenary_mode는
 최초 전환 시 기본값입니다. 이후에는 대시보드 [설정]의 캐릭터별 값을 사용합니다.
 워치독 및 보고 옵션은 계속 이 파일에서 조절합니다.
 
@@ -124,6 +128,11 @@ adjacent_danger_radius
 skip_on_danger
   true: 적대 대상 감지 시 현재 룬북 구역을 스킵합니다.
   false: 위험 감지 후에도 스킵하지 않습니다.
+
+mercenary_mode
+  true: 용병(팔로워 3칸 이상)이 있으면 침공 기간 외에는 적을 무시하고 계속 채집합니다.
+        침공 기간(매달 1일·15일 0시 ~ 다음 날 오전 9시)과 용병이 없을 때는 기존처럼 회피합니다.
+  false: 기존처럼 적대 대상 감지 시 회피합니다.
 
 spell_channeling
   true: 주문전달 도끼를 사용한다고 보고 도끼를 벗지 않습니다.
@@ -156,6 +165,7 @@ if _GGO_CONFIG_READY:
         USE_MAGERY = bool(_script_settings.get("use_magery", USE_MAGERY))
         SPELL_CHANNELING = bool(_script_settings.get("spell_channeling", SPELL_CHANNELING))
         SKIP_ON_DANGER = bool(_script_settings.get("skip_on_danger", SKIP_ON_DANGER))
+        MERCENARY_MODE = bool(_script_settings.get("mercenary_mode", MERCENARY_MODE))
         MONSTER_REPORT_MODE = int(_script_settings.get("monster_report_mode", MONSTER_REPORT_MODE))
         ADJACENT_DANGER_RADIUS = int(_script_settings.get("adjacent_danger_radius", ADJACENT_DANGER_RADIUS))
         USE_WOOD_STORAGE = bool(_script_settings.get("use_wood_storage", USE_WOOD_STORAGE))
@@ -204,7 +214,7 @@ DEFAULT_CHARACTER_SETTINGS = {
 MODE_FIELDS = {
     "use_magery": "USE_MAGERY", "spell_channeling": "SPELL_CHANNELING",
     "use_wood_storage": "USE_WOOD_STORAGE", "bod_collect": "BOD_COLLECT",
-    "skip_on_danger": "SKIP_ON_DANGER"
+    "skip_on_danger": "SKIP_ON_DANGER", "mercenary_mode": "MERCENARY_MODE"
 }
 INITIAL_MODES = dict((key, globals()[var]) for key, var in MODE_FIELDS.items())
 SETTINGS_GUMP_ID = 0x889901
@@ -236,16 +246,57 @@ if 'last_inventory' not in globals(): last_inventory = {}
 if 'monitor_active' not in globals(): monitor_active = False
 if 'is_paused' not in globals(): is_paused = False
 if 'last_dashboard_time' not in globals(): last_dashboard_time = 0
+if 'last_dashboard_sig' not in globals(): last_dashboard_sig = None
+if 'storage_counts' not in globals(): storage_counts = {}
+
+# 마고 보관함 자동수납 로그 (서버 문구라 클라이언트 언어와 무관하게 한글):
+# "[보관함] 채집한 판자 (보통) 170개, 나무껍질 조각 4개를 보관함에 넣었습니다."
+STORAGE_LOG_RE = re.compile(u'^\\[보관함\\] 채집한 (.+)를 보관함에 넣었습니다')
+STORAGE_ITEM_RE = re.compile(u'(.+?) ([\\d,]+)개(?:, |$)')
+BOARD_NAME_RE = re.compile(u'^판자 \\((.+)\\)$')
+# NPC 매입가(고정): 보통 4골드, 한 등급마다 +4
+BOARD_GRADES = [u'보통', u'떡갈나무', u'물푸레나무', u'주목나무', u'심나무', u'피나무', u'서리나무']
+BOARD_PRICES = dict((name, 4 * (i + 1)) for i, name in enumerate(BOARD_GRADES))
+DETAIL_GUMP_ID = 0x889902
+detail_open = False
+storage_journal = None
+storage_cursor = -1.0
+storage_seen = set()
 
 weightpercent, numberofaxetime = 0.9, 10
 cur_b_serial = 0
 cur_r_idx = 0
-LastBodTime = 0
 BOD_CYCLE_INTERVAL = 14700 # 4시간 5분 사이클
+BOD_TIMER_FILE = CONFIG_FILE + ".bod_timer"
+# 영문 / 한글 클라이언트의 "아직 주문 없음" 문구 (cliloc 1072058, 1049039)
+BOD_WAIT_TEXTS = ("offer may be available", "새로운 거래는", "다시 주문을 받을 수")
+
+def load_bod_time():
+    """재시작 전 마지막 BOD 수거 시각을 복구한다. 없거나 비정상이면 0(즉시 수거)."""
+    try:
+        if not File.Exists(BOD_TIMER_FILE): return 0
+        saved = float(File.ReadAllText(BOD_TIMER_FILE).strip())
+        return saved if 0 < saved <= time.time() + 5 else 0
+    except: return 0
+
+def remember_bod_time():
+    global LastBodTime
+    LastBodTime = time.time()
+    try:
+        if not Directory.Exists(SAVE_DIR): Directory.CreateDirectory(SAVE_DIR)
+        File.WriteAllText(BOD_TIMER_FILE, "{:.6f}".format(LastBodTime))
+    except: pass
+
+LastBodTime = load_bod_time()
+BOD_RETRY_DELAY = 600  # BOD 상인 이동 실패 시 재시도 간격 (초)
+BodRetryAt = 0
 
 # [v1.6 신규 전역 변수]
 recorded_rune_map = {}
 danger_encounters = []
+merc_handled = {}   # 용병 모드에서 무시한 적 {serial: 이름} (종료 보고서 한 줄 요약용)
+merc_present = None # 마지막으로 확인한 용병 동행 여부 (변화 시에만 알림)
+MERC_FOLLOWER_SLOTS = 3
 
 
 # -----------------------------------------------------------------------------
@@ -305,10 +356,12 @@ def reset_globals():
     globals().update({
         'start_time': time.time(),
         'total_counts': {'M': 0, 'L': 0},
+        'storage_counts': {},
         'last_inventory': {},
         'monitor_active': False,
         'is_paused': False,
         'last_dashboard_time': 0,
+        'last_dashboard_sig': None,
         'pending_settings_button': -1,
     })
     Journal.Clear()
@@ -469,13 +522,47 @@ def CheckDanger():
     fil.RangeMax = 12
     fil.CheckLineOfSight = True
     nearby_mobs = Mobiles.ApplyFilter(fil)
+    covered = MercenaryCovers()
 
     for m in nearby_mobs:
         if m is None: continue
         if m.Serial == Player.Serial: continue
         if m.Notoriety >= 3 and m.WarMode:
+            if covered:
+                merc_handled[m.Serial] = m.Name or "Unknown"
+                return None
             return m
     return None
+
+def InvasionWindow():
+    # 침공: 매달 1일·15일 0시부터 다음 날(2일·16일) 오전 9시 자동 삭제 전까지
+    t = time.localtime()
+    return t.tm_mday in (1, 15) or (t.tm_mday in (2, 16) and t.tm_hour < 9)
+
+def MercenaryCovers():
+    """용병 모드 + 용병 동행 + 침공 기간 아님 → 용병이 처리하므로 회피하지 않는다."""
+    global merc_present
+    if not MERCENARY_MODE: return False
+    present = Player.Followers >= MERC_FOLLOWER_SLOTS
+    if present != merc_present:
+        if present:
+            Player.HeadMessage(68, "[용병] 동행 확인: 침공 기간 외 적 무시")
+        else:
+            Player.HeadMessage(33, "[용병] 용병 미확인: 기존 회피 모드로 동작")
+            SendDiscord("⚠️ **[용병 해제 감지]** {0} 팔로워 슬롯 {1}칸 — 기존 회피 모드로 전환합니다.".format(
+                Player.Name, Player.Followers))
+        merc_present = present
+    return present and not InvasionWindow()
+
+def MercSummaryLine():
+    if not merc_handled: return ""
+    names = {}
+    for name in merc_handled.values():
+        names[name] = names.get(name, 0) + 1
+    top = sorted(names.items(), key=lambda kv: -kv[1])
+    text = ", ".join("{0} {1}".format(n, c) for n, c in top[:3])
+    if len(top) > 3: text += " 외"
+    return "🛡️ 용병 처리 {0}회 · {1}\n".format(len(merc_handled), text)
 
 def ReportDanger(enemy, book_serial, rune_idx):
     global danger_encounters
@@ -502,10 +589,14 @@ def ReportDanger(enemy, book_serial, rune_idx):
         SendDiscord(msg)
 
 def SendSummaryReport():
-    if not danger_encounters: return
+    if not danger_encounters and not merc_handled: return
 
     msg = "**📊 [GGO 럼버] 작업 종료 보고 (지능형 지형 분석)**\n"
     msg += "👤 보고 캐릭터: **{0}**\n".format(Player.Name)
+    msg += MercSummaryLine()
+    if not danger_encounters:
+        SendDiscord(msg)
+        return
     msg += "**🛑 위험 감지 및 인접 룬 분석 결과**\n"
     msg += "-------------------------------------------\n"
 
@@ -549,9 +640,58 @@ def SendSummaryReport():
 # [5] 모니터링 및 대시보드
 # -----------------------------------------------------------------------------
 
+def _new_journal():
+    from System import Activator, Array, Object, Int32
+    return Activator.CreateInstance(Player.GetType().Assembly.GetType('RazorEnhanced.Journal'),
+                                    Array[Object]([Int32(200)]))
+
+def ReadStorageLog():
+    """보관함 자동수납 로그를 별도 저널 인스턴스로 읽는다.
+    채집 루프의 Journal.Clear()가 지우지 못하고, 같은 줄을 두 번 세지 않도록 타임스탬프 커서로 읽는다."""
+    global storage_journal, storage_cursor, storage_seen
+    if storage_journal is None:
+        try:
+            storage_journal = _new_journal()
+            storage_journal.Clear()  # 실행 전 로그는 세지 않는다
+        except Exception:
+            storage_journal = False  # 생성 실패: 상세 통계 없이 기존 동작
+        return
+    if not storage_journal: return
+    try:
+        rows = storage_journal.GetJournalEntry(float(storage_cursor - 0.001)) or []
+    except Exception:
+        return
+    newest = storage_cursor
+    for entry in rows:
+        stamp, text = float(entry.Timestamp), u'%s' % entry.Text
+        key = (stamp, text)
+        if key in storage_seen: continue
+        storage_seen.add(key)
+        if stamp > newest: newest = stamp
+        # 서버 시스템 메시지만 인정 (채팅·머리 위 메시지로 같은 문구를 흉내 내도 세지 않음)
+        if u'%s' % entry.Type != u'System': continue
+        m = STORAGE_LOG_RE.match(text.strip())
+        if not m: continue
+        for name, count in STORAGE_ITEM_RE.findall(m.group(1)):
+            name = name.strip()
+            storage_counts[name] = storage_counts.get(name, 0) + int(count.replace(',', ''))
+    storage_cursor = newest
+    storage_seen = set(k for k in storage_seen if k[0] >= storage_cursor - 0.001)
+
+def StorageBoards():
+    """보관함으로 들어간 판자 수와 NPC 매입가 기준 골드."""
+    boards = gold = 0
+    for name, count in storage_counts.items():
+        m = BOARD_NAME_RE.match(name)
+        if m:
+            boards += count
+            gold += count * BOARD_PRICES.get(m.group(1), 0)
+    return boards, gold
+
 def UpdateStats():
     global total_counts, last_inventory
     if not monitor_active: return
+    ReadStorageLog()
 
     current_inv = {}
     if Player.Backpack:
@@ -590,24 +730,70 @@ def _Button(gd, x, y, button, text, enabled=False):
     _Label(gd, x + 25, y, text, 167 if enabled else 1152)
 
 def DrawDashboard(force=False):
-    global last_dashboard_time
+    global last_dashboard_time, last_dashboard_sig
     now = time.time()
-    if not force and now - last_dashboard_time < 60: return
-    last_dashboard_time = now
     elapsed = max(0, now - start_time)
-    rate = int(total_counts['L'] * 3600 / elapsed) if elapsed else 0
+    # 가방 집계(일반 보관) + 보관함 자동수납 로그 집계. 보관함을 쓰면 가방 판자는 늘지 않아 중복되지 않는다.
+    stored_boards, stored_gold = StorageBoards()
+    boards = total_counts['L'] + stored_boards
+    # 표시 값(누적·일시정지·경과 분)이 바뀔 때만, 최소 2초 간격으로 다시 그린다 (클릭·드래그 방해 최소화).
+    signature = (boards, stored_gold, len(storage_counts), is_paused, int(elapsed // 60))
+    if not force and (signature == last_dashboard_sig or now - last_dashboard_time < 2): return
+    last_dashboard_time, last_dashboard_sig = now, signature
+    rate = int(boards * 3600 / elapsed) if elapsed else 0
+    gold_rate = int(stored_gold * 3600 / elapsed) if elapsed else 0
     gd = Gumps.CreateGump(movable=True)
     Gumps.AddPage(gd, 0)
-    Gumps.AddBackground(gd, 0, 0, 300, 175, 30546)
+    Gumps.AddBackground(gd, 0, 0, 330, 175, 30546)
     _Label(gd, 20, 15, "GGO 럼버", 52)
-    _Label(gd, 205, 15, "{:02d}:{:02d}".format(int(elapsed // 3600), int(elapsed % 3600 // 60)))
+    _Label(gd, 235, 15, "{:02d}:{:02d}".format(int(elapsed // 3600), int(elapsed % 3600 // 60)))
     _Label(gd, 20, 50, "누적 판자")
-    _Label(gd, 150, 50, "{:,} 개".format(total_counts['L']))
+    total_text = "{:,} 개".format(boards)
+    if storage_counts: total_text += " ({:,} 골드)".format(stored_gold)
+    _Label(gd, 120, 50, total_text)
     _Label(gd, 20, 80, "시간당 채집")
-    _Label(gd, 150, 80, "{:,} 개/h".format(rate))
+    rate_text = "{:,} 개/h".format(rate)
+    if storage_counts: rate_text += " ({:,} 골드/h)".format(gold_rate)
+    _Label(gd, 120, 80, rate_text)
     _Button(gd, 20, 125, 101, "재개" if is_paused else "일시정지")
-    _Button(gd, 175, 125, 100, "설정")
+    if storage_counts: _Button(gd, 125, 125, 102, "상세")
+    _Button(gd, 220, 125, 100, "설정")
     Gumps.SendGump(DASHBOARD_GUMP_ID, Player.Serial, 400, 400, gd.gumpDefinition, gd.gumpStrings)
+    if detail_open: DrawDetail()
+
+def DrawDetail():
+    """보관함 자동수납 품목별 수량·골드 (보관함 사용자 전용)."""
+    global detail_open
+    if not storage_counts:
+        detail_open = False
+        return
+    elapsed = max(1, time.time() - start_time)
+    rows = []
+    for grade in BOARD_GRADES:
+        name = u'판자 (%s)' % grade
+        if storage_counts.get(name): rows.append((name, storage_counts[name], BOARD_PRICES[grade]))
+    known = set(r[0] for r in rows)
+    # 가격표에 없는 판자 등급·특수 재료는 수량만 표시 (많은 순)
+    rows += [(n, c, None) for n, c in sorted(storage_counts.items(), key=lambda kv: -kv[1]) if n not in known]
+    total_gold = sum(c * p for n, c, p in rows if p)
+    gd = Gumps.CreateGump(movable=True)
+    Gumps.AddPage(gd, 0)
+    Gumps.AddBackground(gd, 0, 0, 330, 125 + 22 * len(rows), 30546)
+    _Label(gd, 20, 15, "보관함 채집 상세", 52)
+    _Button(gd, 235, 15, 1, "갱신")
+    for x, text in ((20, "재료"), (170, "수량"), (245, "골드")):
+        _Label(gd, x, 45, text, 946)
+    y = 67
+    for name, count, price in rows:
+        _Label(gd, 20, y, name[:16])
+        _Label(gd, 170, y, "{:,}".format(count))
+        _Label(gd, 245, y, "{:,}".format(count * price) if price else "-", 53 if price else 946)
+        y += 22
+    _Label(gd, 20, y + 8, "총 가치", 52)
+    _Label(gd, 170, y + 8, "{:,} 골드".format(total_gold), 53)
+    _Label(gd, 20, y + 30, "시간당 골드", 52)
+    _Label(gd, 170, y + 30, "{:,} 골드/h".format(int(total_gold * 3600 / elapsed)), 53)
+    Gumps.SendGump(DETAIL_GUMP_ID, Player.Serial, 400, 580, gd.gumpDefinition, gd.gumpStrings)
 
 def DrawSettings():
     if not settings_open: return
@@ -617,7 +803,7 @@ def DrawSettings():
             (203, "잔여물 보관함" if USE_WOOD_STORAGE else "나무 보관함", Treecontainer)]
     if USE_WOOD_STORAGE: rows.append((204, "우드스토리지", WoodStorage))
     if BOD_COLLECT: rows.append((205, "BOD 보관함", BodContainer))
-    height = 370 + 30 * (len(rows) + len(Treebook))
+    height = 400 + 30 * (len(rows) + len(Treebook))
     Gumps.AddBackground(gd, 0, 0, 430, height, 30546)
     _Label(gd, 20, 15, "GGO 럼버 설정 v" + CURRENT_VERSION, 52)
     _Button(gd, 330, 15, 1, "닫기")
@@ -626,11 +812,12 @@ def DrawSettings():
         (85, "자원 보관", 11, USE_WOOD_STORAGE, "우드스토리지" if USE_WOOD_STORAGE else "일반 보관함"),
         (115, "주문전달 도끼", 12, SPELL_CHANNELING, "켜짐" if SPELL_CHANNELING else "꺼짐"),
         (145, "BOD 자동 수거", 13, BOD_COLLECT, "켜짐" if BOD_COLLECT else "꺼짐"),
-        (175, "위험 지역 스킵", 14, SKIP_ON_DANGER, "켜짐" if SKIP_ON_DANGER else "꺼짐")]:
+        (175, "위험 지역 스킵", 14, SKIP_ON_DANGER, "켜짐" if SKIP_ON_DANGER else "꺼짐"),
+        (205, "용병 모드", 15, MERCENARY_MODE, "켜짐" if MERCENARY_MODE else "꺼짐")]:
         _Label(gd, 20, y, label)
         _Button(gd, 230, y, bid, text, bool(value))
-    _Label(gd, 20, 215, "대상 지정", 52)
-    y = 245
+    _Label(gd, 20, 245, "대상 지정", 52)
+    y = 275
     for bid, label, serial in rows:
         _Label(gd, 20, y, label)
         _Label(gd, 180, y, "0x{:08X}".format(serial) if serial > 0 else "미지정", 99)
@@ -650,7 +837,7 @@ def DrawSettings():
     Gumps.SendGump(SETTINGS_GUMP_ID, Player.Serial, 710, 200, gd.gumpDefinition, gd.gumpStrings)
 
 def GGO_GumpHandler():
-    global settings_open, is_paused, g_lumber_quit, reset_confirm
+    global settings_open, is_paused, g_lumber_quit, reset_confirm, detail_open
     bid = _ReadButton(DASHBOARD_GUMP_ID)
     if bid == 0:
         g_lumber_quit = True
@@ -663,6 +850,15 @@ def GGO_GumpHandler():
         is_paused = not is_paused
         Journal.Clear()
         DrawDashboard(force=True)
+    elif bid == 102:
+        detail_open = True
+        DrawDashboard(force=True)
+    # 상세 창: 우클릭은 상세 창만 닫는다 (스크립트 종료는 대시보드 우클릭)
+    dbid = _ReadButton(DETAIL_GUMP_ID)
+    if dbid == 0:
+        detail_open = False
+    elif dbid == 1:
+        DrawDetail()
     bid = _ReadButton(SETTINGS_GUMP_ID)
     if bid < 0: return -1
     if bid in (0, 1):
@@ -776,7 +972,7 @@ def SettingsSession(first_button=-1):
     fields = {201: 'myaxe', 202: 'Homebook', 203: 'Treecontainer',
               204: 'WoodStorage', 205: 'BodContainer'}
     modes = {10: 'USE_MAGERY', 11: 'USE_WOOD_STORAGE', 12: 'SPELL_CHANNELING',
-             13: 'BOD_COLLECT', 14: 'SKIP_ON_DANGER'}
+             13: 'BOD_COLLECT', 14: 'SKIP_ON_DANGER', 15: 'MERCENARY_MODE'}
     requires_done = bool(MissingSettings()) or first_button not in modes
     DrawSettings()
     try:
@@ -883,23 +1079,39 @@ def EquipAfterTravel():
         Misc.Pause(1200)
         Player.EquipItem(myaxe)
 
+# 직전 시전 직후라 시전이 거부된 경우 (cliloc 502644 / 502642, 영문·한글)
+SPELL_RECOVERY_TEXTS = ("not yet recovered", "회복하지 못했습니다", "already casting", "이미 주문을 시전")
+
 def TravelBook(book, rune_index, bod=False):
     ServiceUI()
     UnequipForTravel()
     start_x, start_y = Player.Position.X, Player.Position.Y
+    moved = lambda: Player.Position.X != start_x or Player.Position.Y != start_y
     try:
-        Items.UseItem(book); UIPause(1500)
-        if not UIWaitForGump(0x59, 5000): return False
-        # ServUO: 50..65=Recall / 75..90=Sacred Journey (0-based rune index)
-        Gumps.SendAction(0x59, (50 if USE_MAGERY else 75) + rune_index)
-        if bod:
-            UIPause(4000)
-            return True
-        wait_time = 0
-        while Player.Position.X == start_x and Player.Position.Y == start_y and wait_time < 5000:
-            UIPause(250)
-            wait_time += 250
-        return Player.Position.X != start_x or Player.Position.Y != start_y
+        for attempt in range(3):
+            Items.UseItem(book)  # 검프가 뜨면 바로 누른다 (고정 1.5초 대기 제거)
+            if not UIWaitForGump(0x59, 5000):
+                Player.HeadMessage(33, "룬북 검프 무응답: 한 번 더 엽니다")
+                Items.UseItem(book)
+                if not UIWaitForGump(0x59, 5000): return False
+            Journal.Clear()
+            # ServUO: 50..65=Recall / 75..90=Sacred Journey (0-based rune index)
+            Gumps.SendAction(0x59, (50 if USE_MAGERY else 75) + rune_index)
+            # BOD 이동은 상인 앞 안정화를 위해 4초를 채우고, 일반 이동은 도착 즉시 진행한다.
+            limit, waited, refused = (4000 if bod else 5000), 0, False
+            while waited < limit:
+                if any(Journal.Search(text) for text in SPELL_RECOVERY_TEXTS):
+                    refused = True
+                    break
+                if not bod and moved(): break
+                UIPause(250)
+                waited += 250
+            if refused and attempt < 2:
+                Player.HeadMessage(33, "주문 회복 대기 후 다시 시전합니다")
+                UIPause(750)
+                continue
+            return moved()
+        return moved()
     finally:
         EquipAfterTravel()
 
@@ -916,38 +1128,45 @@ def CollectBOD(sn):
         UIWaitForGump(2611865322, 1500)
         Gumps.SendAction(2611865322, 1)
 
-        if Journal.Search("offer may be available"):
+        if any(Journal.Search(text) for text in BOD_WAIT_TEXTS):
             Journal.Clear()
             Player.HeadMessage(33, "BOD 수거 스킵 (대기 시간 미도달)")
             break
         UIPause(1000)
 
+def BodTravelFailed():
+    # 수거 시각은 기록하지 않는다. 룬마다 재시도하며 시간을 버리지 않게 10분 뒤 다시 시도.
+    global BodRetryAt
+    BodRetryAt = time.time() + BOD_RETRY_DELAY
+    Player.HeadMessage(33, "BOD 상인 이동 실패: 10분 뒤 다시 시도합니다")
+
 def ProcessBOD():
     global LastBodTime
     if not BOD_COLLECT or BodContainer <= 0: return
 
+    if time.time() < BodRetryAt: return
     if LastBodTime == 0 or (time.time() - LastBodTime) >= BOD_CYCLE_INTERVAL:
         Player.HeadMessage(66, "★ BOD 수거 사이클 시작 ★")
         SendDiscord("📦 **[BOD 수거]** {0} 캐릭터가 BOD 수거를 시작합니다.".format(Player.Name))
 
-        TravelBook(Homebook, 1, bod=True)
+        if not TravelBook(Homebook, 1, bod=True): return BodTravelFailed()
         CollectBOD(0x0001BD87); CollectBOD(0x000000E3)
 
-        TravelBook(Homebook, 2, bod=True)
+        if not TravelBook(Homebook, 2, bod=True): return BodTravelFailed()
         CollectBOD(0x0000023B); CollectBOD(0x0000023F); CollectBOD(0x0001BA3A)
 
-        TravelBook(Homebook, 0, bod=True)
+        # 수령은 끝났으므로 집 이동이 실패해도 시각은 기록한다. BOD는 다음 회차에 보관된다.
+        if TravelBook(Homebook, 0, bod=True):
+            loop_breaker = 0
+            while SafeFindByID(0x2258, -1, Player.Backpack.Serial) and loop_breaker < 30:
+                ServiceUI()
+                bod_item = SafeFindByID(0x2258, -1, Player.Backpack.Serial)
+                if bod_item:
+                    SafeMove(bod_item, BodContainer, -1)
+                    UIPause(1200)
+                loop_breaker += 1
 
-        loop_breaker = 0
-        while SafeFindByID(0x2258, -1, Player.Backpack.Serial) and loop_breaker < 30:
-            ServiceUI()
-            bod_item = SafeFindByID(0x2258, -1, Player.Backpack.Serial)
-            if bod_item:
-                SafeMove(bod_item, BodContainer, -1)
-                UIPause(1200)
-            loop_breaker += 1
-
-        LastBodTime = time.time()
+        remember_bod_time()
         Player.HeadMessage(66, "★ BOD 수거 완료 ★")
 
 # -----------------------------------------------------------------------------
@@ -1090,6 +1309,8 @@ def cuttrees():
 def Initialize_Routine():
     global monitor_active, start_time, last_inventory
     weighthome(force=True)
+    if MERCENARY_MODE:
+        Player.ChatSay("all guard me"); UIPause(500)
     if not monitor_active: start_time = time.time()
     monitor_active = True
 
@@ -1126,6 +1347,9 @@ def RunHarvest():
                 HandleDeath(b_serial, r_idx)
                 ServiceUI()
                 UpdateStats(); DrawDashboard()
+
+                # 보관함 자동수납·용병 모드에서는 무게 귀환이 드물어 채집 중에도 BOD 시간을 확인한다.
+                ProcessBOD()
 
                 StartX, StartY = Player.Position.X, Player.Position.Y
 
@@ -1196,6 +1420,7 @@ while _restart_count <= WATCHDOG_MAX_RESTARTS:
     try:
         Gumps.CloseGump(DASHBOARD_GUMP_ID)
         Gumps.CloseGump(SETTINGS_GUMP_ID)
+        Gumps.CloseGump(DETAIL_GUMP_ID)
         RunLumber()
         break
 
@@ -1227,6 +1452,7 @@ while _restart_count <= WATCHDOG_MAX_RESTARTS:
     finally:
         Gumps.CloseGump(DASHBOARD_GUMP_ID)
         Gumps.CloseGump(SETTINGS_GUMP_ID)
+        Gumps.CloseGump(DETAIL_GUMP_ID)
 
     if _restart_count >= WATCHDOG_MAX_RESTARTS:
         try: Player.HeadMessage(33, "[워치독] 재시작 한도({0}회) 초과. 스크립트를 종료합니다.".format(WATCHDOG_MAX_RESTARTS))
