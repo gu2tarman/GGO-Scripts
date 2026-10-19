@@ -2,14 +2,14 @@
 
 
 # =============================================================================
-# [GGO Project] 바울 마이닝 인핸스 (Baul Mining Enhance) v1.9
+# [GGO Project] 바울 마이닝 인핸스 (Baul Mining Enhance) v1.9.1
 # =============================================================================
 # 원작자의 소중한 소스코드를 기반으로 GGO Project에서 기능적인 개선을 시도한 버전입니다.
 # =============================================================================
 
 SCRIPT_ID = "GGO_MINING"
 SCRIPT_NAME = "GGO_바울마이닝인핸스"
-CURRENT_VERSION = "1.9"
+CURRENT_VERSION = "1.9.1"
 
 import os, sys
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -992,9 +992,12 @@ def TravelBook(book, rune_index, bod=False):
     start_x, start_y = Player.Position.X, Player.Position.Y
     moved = lambda: Player.Position.X != start_x or Player.Position.Y != start_y
     for attempt in range(3):
+        # 남아 있는 룬북 창을 먼저 닫는다. 안 닫으면 새 창 도착 전에 옛 창으로 버튼이 가서 무시된다.
+        Gumps.CloseGump(0x59)
         Items.UseItem(book)  # 검프가 뜨면 바로 누른다 (고정 1.5초 대기 제거)
         if not UIWaitForGump(0x59, 5000):
             Player.HeadMessage(33, "룬북 검프 무응답: 한 번 더 엽니다")
+            Gumps.CloseGump(0x59)
             Items.UseItem(book)
             if not UIWaitForGump(0x59, 5000): return False
         Journal.Clear()

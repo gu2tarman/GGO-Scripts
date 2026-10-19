@@ -2,7 +2,7 @@
 
 
 # =============================================================================
-# [GGO Project] 바울 럼버 인핸스 (Baul Lumber Enhance) v2.0
+# [GGO Project] 바울 럼버 인핸스 (Baul Lumber Enhance) v2.1
 # =============================================================================
 #
 # 원작자의 소중한 소스코드를 기반으로 GGO Project에서 기능적인 개선을 완료한 버전입니다.
@@ -10,7 +10,7 @@
 
 SCRIPT_ID = "GGO_LUMBER"
 SCRIPT_NAME = "GGO_바울럼버인핸스"
-CURRENT_VERSION = "2.0"
+CURRENT_VERSION = "2.1"
 
 import os
 import sys
@@ -254,14 +254,35 @@ if 'storage_counts' not in globals(): storage_counts = {}
 STORAGE_LOG_RE = re.compile(u'^\\[보관함\\] 채집한 (.+)를 보관함에 넣었습니다')
 STORAGE_ITEM_RE = re.compile(u'(.+?) ([\\d,]+)개(?:, |$)')
 BOARD_NAME_RE = re.compile(u'^판자 \\((.+)\\)$')
-# NPC 매입가(고정): 보통 4골드, 한 등급마다 +4
+# NPC 매입가(고정, 마고 판매 대금 로그 실측): 보통~심나무는 4골드씩 오르고 피나무 25, 서리나무 30
 BOARD_GRADES = [u'보통', u'떡갈나무', u'물푸레나무', u'주목나무', u'심나무', u'피나무', u'서리나무']
-BOARD_PRICES = dict((name, 4 * (i + 1)) for i, name in enumerate(BOARD_GRADES))
+BOARD_PRICES = dict(zip(BOARD_GRADES, [4, 8, 12, 16, 20, 25, 30]))
 DETAIL_GUMP_ID = 0x889902
 detail_open = False
 storage_journal = None
 storage_cursor = -1.0
 storage_seen = set()
+
+# 판자 판매 (은행: 마고 보관함 → 무게 한도만큼 인출 → NPC 판매 반복)
+SELL_GUMP_ID = 0x889903
+SELL_BATCH_MAX = 30000     # 1회 판매 안정 수량 (마고 실측)
+BOARDS_PER_STONE = 200     # 판자 200개 = 1스톤
+SELL_WEIGHT_MARGIN = 5     # 인출 후에도 남겨 둘 무게 여유 (스톤)
+SELL_NPC_RANGE = 8
+SELL_NPC_BID, SELL_START_BID, SELL_STOP_BID = 3010, 3030, 3031
+BOARD_HUES = {u'보통': 0x0000, u'떡갈나무': 0x07DA, u'물푸레나무': 0x04A7, u'주목나무': 0x04A8,
+              u'심나무': 0x04A9, u'피나무': 0x04AA, u'서리나무': 0x047F}
+SALE_LOG_RE = re.compile(u'^판매 대금 ([\\d,]+) 골드가 은행에 입금되었습니다')
+SellGrades = [False] * len(BOARD_GRADES)
+SellKeep = [0] * len(BOARD_GRADES)
+SellNpc = 0
+sell_open = False
+sell_running = False
+sell_stop = False
+sell_notice = ""
+sell_results = None   # 마지막 판매 {등급: {'sold', 'gold', 'missing', 'left'}}
+sell_elapsed = 0
+pending_sell = 0
 
 weightpercent, numberofaxetime = 0.9, 10
 cur_b_serial = 0
@@ -307,6 +328,8 @@ def save_json_logic():
     global myaxe, Homebook, Treecontainer, WoodStorage, Treebook, BodContainer
     save_data = {"Axe": int(myaxe), "Home": int(Homebook), "Container": int(Treecontainer), "WoodStorage": int(WoodStorage), "BodContainer": int(BodContainer), "Trees": [int(x) for x in Treebook]}
     save_data.update(dict((key, globals()[var]) for key, var in MODE_FIELDS.items()))
+    save_data.update({"SellNpc": int(SellNpc), "SellGrades": [bool(v) for v in SellGrades],
+                      "SellKeep": [int(v) for v in SellKeep]})
     try:
         if _GGO_CONFIG_READY:
             save_character_settings(SCRIPT_NAME, Player.Name, save_data)
@@ -339,11 +362,24 @@ def load_json_logic():
             value = load_data.get(key, INITIAL_MODES[key])
             if value not in (True, False, 0, 1): return False
             values[var] = int(value) if key == "bod_collect" else bool(value)
+        values.update(LoadSellSettings(load_data))
         globals().update(values)
         if any(key not in load_data for key in MODE_FIELDS):
             SaveSettings()
         return True
     except: return False
+
+def LoadSellSettings(load_data):
+    """판매 설정은 없거나 잘못돼도 채집 설정 읽기를 실패시키지 않는다 (기본값: 전부 제외, 남길 수량 0)."""
+    count = len(BOARD_GRADES)
+    try: npc = max(0, int(load_data.get("SellNpc", 0)))
+    except: npc = 0
+    grades, keep = [False] * count, [0] * count
+    try:
+        for i, v in enumerate(list(load_data.get("SellGrades", []))[:count]): grades[i] = v is True
+        for i, v in enumerate(list(load_data.get("SellKeep", []))[:count]): keep[i] = max(0, int(v))
+    except: pass
+    return {'SellNpc': npc, 'SellGrades': grades, 'SellKeep': keep}
 
 def trim_working_set():
     try:
@@ -363,6 +399,9 @@ def reset_globals():
         'last_dashboard_time': 0,
         'last_dashboard_sig': None,
         'pending_settings_button': -1,
+        'pending_sell': 0,
+        'sell_running': False,
+        'sell_stop': False,
     })
     Journal.Clear()
     Target.Cancel()
@@ -744,7 +783,7 @@ def DrawDashboard(force=False):
     gold_rate = int(stored_gold * 3600 / elapsed) if elapsed else 0
     gd = Gumps.CreateGump(movable=True)
     Gumps.AddPage(gd, 0)
-    Gumps.AddBackground(gd, 0, 0, 330, 175, 30546)
+    Gumps.AddBackground(gd, 0, 0, 330, 205, 30546)
     _Label(gd, 20, 15, "GGO 럼버", 52)
     _Label(gd, 235, 15, "{:02d}:{:02d}".format(int(elapsed // 3600), int(elapsed % 3600 // 60)))
     _Label(gd, 20, 50, "누적 판자")
@@ -758,6 +797,7 @@ def DrawDashboard(force=False):
     _Button(gd, 20, 125, 101, "재개" if is_paused else "일시정지")
     if storage_counts: _Button(gd, 125, 125, 102, "상세")
     _Button(gd, 220, 125, 100, "설정")
+    _Button(gd, 20, 160, 103, "판자 판매", sell_open)
     Gumps.SendGump(DASHBOARD_GUMP_ID, Player.Serial, 400, 400, gd.gumpDefinition, gd.gumpStrings)
     if detail_open: DrawDetail()
 
@@ -794,6 +834,119 @@ def DrawDetail():
     _Label(gd, 20, y + 30, "시간당 골드", 52)
     _Label(gd, 170, y + 30, "{:,} 골드/h".format(int(total_gold * 3600 / elapsed)), 53)
     Gumps.SendGump(DETAIL_GUMP_ID, Player.Serial, 400, 580, gd.gumpDefinition, gd.gumpStrings)
+
+def DrawSell():
+    """판자 판매 창: 등급별 판매 여부·보관함에 남길 수량, 마지막 판매 결과."""
+    if not sell_open: return
+    results = [(g, sell_results[g]) for g in BOARD_GRADES if sell_results and g in sell_results]
+    height = 300 + 26 * len(BOARD_GRADES) + (60 + 22 * len(results) if results else 0)
+    gd = Gumps.CreateGump(movable=True)
+    Gumps.AddPage(gd, 0)
+    Gumps.AddBackground(gd, 0, 0, 430, height, 30546)
+    _Label(gd, 20, 15, "판자 판매", 52)
+    _Button(gd, 330, 15, 1, "닫기")
+    npc = Mobiles.FindBySerial(SellNpc) if SellNpc > 0 else None
+    _Label(gd, 20, 45, "판매 NPC")
+    _Label(gd, 110, 45, (npc.Name or "")[:12] if npc else ("0x{:08X}".format(SellNpc) if SellNpc > 0 else "미지정"), 99)
+    _Button(gd, 325, 45, SELL_NPC_BID, "변경" if SellNpc > 0 else "지정")
+    for x, text in ((20, "등급"), (130, "판매"), (215, "보관함에 남길 수량"), (330, "빠른 선택")):
+        _Label(gd, x, 75, text, 946)
+    y = 100
+    for i, grade in enumerate(BOARD_GRADES):
+        _Label(gd, 20, y, grade)
+        _Button(gd, 130, y, 300 + i, "판매" if SellGrades[i] else "제외", SellGrades[i])
+        Gumps.AddBackground(gd, 212, y - 2, 90, 22, 9350)
+        Gumps.AddTextEntry(gd, 218, y, 80, 20, 0, 10 + i, "{0}".format(SellKeep[i]))
+        _Button(gd, 330, y, 320 + i, "여기까지")
+        y += 26
+    _Label(gd, 20, y + 6, "남길 수량만큼 보관함에 남기고 나머지를 팝니다.", 946)
+    _Label(gd, 20, y + 28, "은행의 판매 NPC 근처에서 시작하세요.", 946)
+    if sell_running: _Button(gd, 20, y + 60, SELL_STOP_BID, "판매 중지", True)
+    else: _Button(gd, 20, y + 60, SELL_START_BID, "판매 시작")
+    _Label(gd, 20, y + 90, sell_notice[:34], 99)
+    if results:
+        y += 125
+        for x, text in ((20, "판매 결과"), (130, "수량"), (215, "골드"), (320, "남은 재고")):
+            _Label(gd, x, y, text, 946)
+        total = 0
+        for grade, r in results:
+            y += 22
+            gold = SaleGold(grade, r)
+            total += gold
+            _Label(gd, 20, y, grade)
+            _Label(gd, 130, y, "{:,}".format(r['sold']))
+            _Label(gd, 215, y, "{:,}".format(gold) + ("*" if r['missing'] else ""), 53)
+            _Label(gd, 320, y, "-" if r['left'] is None else "{:,}".format(r['left']))
+        _Label(gd, 20, y + 26, "총 수익", 52)
+        _Label(gd, 130, y + 26, "{:,} 골드 ({:d}분)".format(total, int(sell_elapsed // 60)), 53)
+    Gumps.SendGump(SELL_GUMP_ID, Player.Serial, 760, 150, gd.gumpDefinition, gd.gumpStrings)
+
+def SaleGold(grade, r):
+    """입금 로그 합계 + 로그를 못 읽은 수량은 매입가로 추정 (* 표시)."""
+    return r['gold'] + r['missing'] * BOARD_PRICES[grade]
+
+def _ReadSellResponse():
+    gd = Gumps.GetGumpData(SELL_GUMP_ID)
+    if gd is None or gd.buttonid < 0: return -1, {}
+    texts = {}
+    try:
+        ids, values = list(gd.textID), list(gd.text)
+        for i, tid in enumerate(ids):
+            if i < len(values): texts[int(tid)] = u'%s' % values[i]
+    except: pass
+    button = gd.buttonid
+    gd.buttonid = -1
+    gd.hasResponse = False
+    return button, texts
+
+def _ApplyKeepTexts(texts):
+    """입력칸 값을 남길 수량에 반영한다. (바뀜 여부, 오류 문구)"""
+    changed, error = False, ""
+    for i in range(len(BOARD_GRADES)):
+        if 10 + i not in texts: continue
+        raw = texts[10 + i].replace(',', '').strip()
+        if raw == "": raw = "0"
+        if not re.match(r'^\d+$', raw):
+            error = "{0}: 남길 수량은 숫자로 입력하세요".format(BOARD_GRADES[i])
+            continue
+        if int(raw) != SellKeep[i]:
+            SellKeep[i] = int(raw)
+            changed = True
+    return changed, error
+
+def HandleSellButton(bid, texts):
+    global sell_open, sell_notice, pending_sell, sell_stop, SellGrades
+    if bid in (0, 1):
+        sell_open = False   # 창만 닫는다. 진행 중인 판매는 계속된다.
+        DrawDashboard(force=True)
+        return
+    if sell_running:
+        if bid == SELL_STOP_BID:
+            sell_stop = True
+            sell_notice = "이번 묶음까지 팔고 중지합니다"
+        else:
+            sell_notice = "판매 중에는 설정을 바꿀 수 없습니다"
+        DrawSell()
+        return
+    changed, error = _ApplyKeepTexts(texts)
+    count = len(BOARD_GRADES)
+    if 300 <= bid < 300 + count:
+        SellGrades[bid - 300] = not SellGrades[bid - 300]
+        changed = True
+    elif 320 <= bid < 320 + count:
+        SellGrades = [j <= bid - 320 for j in range(count)]
+        changed = True
+    elif bid == SELL_NPC_BID:
+        pending_sell = bid
+    elif bid == SELL_START_BID:
+        problem = error or SellProblem()
+        if problem: sell_notice = problem
+        else:
+            pending_sell = bid
+            sell_notice = "판매를 시작합니다"
+    if changed: SaveSettings()
+    if error: sell_notice = error
+    DrawSell()
 
 def DrawSettings():
     if not settings_open: return
@@ -853,6 +1006,12 @@ def GGO_GumpHandler():
     elif bid == 102:
         detail_open = True
         DrawDashboard(force=True)
+    elif bid == 103:
+        globals()['sell_open'] = True
+        DrawDashboard(force=True)
+        DrawSell()
+    sbid, texts = _ReadSellResponse()
+    if sbid >= 0: HandleSellButton(sbid, texts)
     # 상세 창: 우클릭은 상세 창만 닫는다 (스크립트 종료는 대시보드 우클릭)
     dbid = _ReadButton(DETAIL_GUMP_ID)
     if dbid == 0:
@@ -904,8 +1063,12 @@ def UIWaitForTarget(milliseconds, noshow=False):
     return False
 
 def ServiceUI():
-    global pending_settings_button
+    global pending_settings_button, pending_sell
     while True:
+        if pending_sell:
+            # 판매·NPC 지정은 채집 호출 스택을 끝낸 뒤 RunLumber에서 처리한다.
+            bid, pending_sell = pending_sell, 0
+            raise _SettingsEdit(bid)
         if pending_settings_button > 1:
             bid = pending_settings_button
             pending_settings_button = -1
@@ -957,6 +1120,7 @@ def ResetSettings():
     global myaxe, Homebook, Treecontainer, WoodStorage, BodContainer, Treebook, reset_confirm
     myaxe = Homebook = Treecontainer = WoodStorage = BodContainer = 0
     Treebook = []
+    globals().update(LoadSellSettings({}))
     for key, var in MODE_FIELDS.items():
         globals()[var] = LUMBER_SCRIPT_SETTINGS_DEFAULTS[key]
     reset_confirm = False
@@ -1089,9 +1253,12 @@ def TravelBook(book, rune_index, bod=False):
     moved = lambda: Player.Position.X != start_x or Player.Position.Y != start_y
     try:
         for attempt in range(3):
+            # 남아 있는 룬북 창을 먼저 닫는다. 안 닫으면 새 창 도착 전에 옛 창으로 버튼이 가서 무시된다.
+            Gumps.CloseGump(0x59)
             Items.UseItem(book)  # 검프가 뜨면 바로 누른다 (고정 1.5초 대기 제거)
             if not UIWaitForGump(0x59, 5000):
                 Player.HeadMessage(33, "룬북 검프 무응답: 한 번 더 엽니다")
+                Gumps.CloseGump(0x59)
                 Items.UseItem(book)
                 if not UIWaitForGump(0x59, 5000): return False
             Journal.Clear()
@@ -1168,6 +1335,320 @@ def ProcessBOD():
 
         remember_bod_time()
         Player.HeadMessage(66, "★ BOD 수거 완료 ★")
+
+# -----------------------------------------------------------------------------
+# [신규] 판자 판매: 마고 보관함 → 무게 한도만큼 인출 → NPC 판매 반복
+# 보관함 창 해석은 마이닝 보관함 정리와 같다. 품목 버튼 번호는 화면 줄마다 바뀌므로
+# 매번 문구로 찾고 기대 번호와 대조하며, 어긋나면 누르지 않는다.
+# -----------------------------------------------------------------------------
+MARGO_STORAGE_GUMP_ID = 0x86ADFB0B
+MARGO_STORAGE_SEARCH_BUTTON = 5
+
+class _StorageError(Exception):
+    pass
+
+class _SellAbort(Exception):
+    pass
+
+def _storage_clean(value):
+    return re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', value)).strip()
+
+def _storage_decode(layout, raw_strings):
+    """RE가 압축 검프에서 빠뜨린 빈 입력칸 문자열을 입력칸별로 복원한다.
+    보관함 라벨은 HTML이고 수량 입력값은 숫자뿐이라 둘을 구분할 수 있다."""
+    refs = {}
+    for raw in re.findall(r'\{\s*([^{}]+?)\s*\}', layout):
+        parts = raw.split()
+        if not parts: continue
+        kind = parts[0].lower()
+        pos = {'htmlgump': 5, 'text': 4, 'textentry': 7}.get(kind)
+        if pos is not None:
+            refs[int(parts[pos])] = (kind, int(parts[6]) if kind == 'textentry' else None)
+    if not refs: raise _StorageError(u'보관함 문자열 참조 없음')
+    source = [s for s in raw_strings if s not in (u'', u'None')]
+    result, cursor = [], 0
+    for index in range(max(refs) + 1):
+        if index not in refs: raise _StorageError(u'예상하지 못한 보관함 문자열 인덱스')
+        kind, entry_id = refs[index]
+        value = source[cursor] if cursor < len(source) else u''
+        if kind == 'textentry':
+            if not value or value.lstrip().startswith(u'<'):
+                result.append(u'')
+                continue
+            # 검색칸(1)은 아무 글자나, 수량칸은 숫자만 온다.
+            if entry_id != 1 and not re.match(r'^\d+$', value.strip()):
+                raise _StorageError(u'수량 입력 문자열을 해석할 수 없습니다')
+        result.append(value)
+        if value: cursor += 1
+    if cursor != len(source): raise _StorageError(u'보관함 문자열 수가 레이아웃과 다릅니다')
+    return result
+
+def _storage_parse(layout, raw_strings):
+    strings = _storage_decode(layout, raw_strings)
+    if len(strings) < 6 or u'마고 보관함' not in _storage_clean(strings[0]):
+        raise _StorageError(u'마고 보관함 창을 확인할 수 없습니다')
+    labels, buttons, entries = [], [], []
+    for raw in re.findall(r'\{\s*([^{}]+?)\s*\}', layout):
+        parts = raw.split()
+        if not parts: continue
+        kind = parts[0].lower()
+        if kind == 'htmlgump':
+            labels.append((int(parts[1]), int(parts[2]), _storage_clean(strings[int(parts[5])])))
+        elif kind == 'button' and int(parts[5]) == 1:
+            buttons.append((int(parts[1]), int(parts[2]), int(parts[7])))
+        elif kind == 'textentry':
+            entries.append((int(parts[1]), int(parts[2]), int(parts[6])))
+    return dict(labels=labels, buttons=buttons, entries=entries)
+
+def _storage_read(stage):
+    # 응답을 보내면 RE가 이전 검프 캐시를 지우므로, 새 검프가 올 때까지 기다린다.
+    deadline = time.time() + 8.0
+    while not Gumps.HasGump(MARGO_STORAGE_GUMP_ID):
+        if time.time() >= deadline: raise _StorageError(u'창 응답 대기 초과: ' + stage)
+        UIPause(50)
+    gd = Gumps.GetGumpData(MARGO_STORAGE_GUMP_ID)
+    layout = u'%s' % (Gumps.GetGumpRawLayout(MARGO_STORAGE_GUMP_ID) or u'')
+    raw = [u'%s' % v if v is not None else u'' for v in gd.stringList]
+    return _storage_parse(layout, raw)
+
+def _storage_reply(button, stage, search=u'', entry=None, amount=None):
+    # 검색칸 값을 매번 함께 보낸다: 빈 값이면 이전 검색어가 분류 목록을 가리지 않는다.
+    ids, values = [1], [search]
+    if entry is not None:
+        ids.append(entry)
+        values.append(str(amount))
+    Gumps.SendAdvancedAction(MARGO_STORAGE_GUMP_ID, button, [], ids, values)
+    return _storage_read(stage)
+
+def _storage_result(state):
+    return [v[2] for v in state['labels'] if v[1] >= 580]
+
+def _storage_search(name):
+    """보관함을 새로 열고 품목 이름으로 검색한다."""
+    if Gumps.HasGump(MARGO_STORAGE_GUMP_ID):
+        Gumps.CloseGump(MARGO_STORAGE_GUMP_ID); UIPause(300)
+    Player.ChatSay(0, u'[보관함')
+    state = _storage_read(u'열기')
+    if not any(b[2] == MARGO_STORAGE_SEARCH_BUTTON and b[1] <= 20 and 640 <= b[0] <= 670 for b in state['buttons']):
+        raise _StorageError(u'검색 버튼을 확인할 수 없습니다')
+    return _storage_reply(MARGO_STORAGE_SEARCH_BUTTON, u'검색', search=name)
+
+def _storage_row(state, name):
+    """검색 결과에서 품목 줄의 (인출 버튼, 입력칸, 재고). 줄이 없으면 None (재고 없음)."""
+    names = [v for v in state['labels'] if 200 <= v[0] < 490 and
+             re.match(u'^' + re.escape(name) + u'( |$)', v[2])]
+    if not names: return None
+    if len(names) != 1: raise _StorageError(name + u' 줄을 하나로 찾지 못했습니다')
+    y = names[0][1]
+    buttons = [b[2] for b in state['buttons'] if b[0] >= 870 and abs(b[1] - y) <= 8]
+    entries = [e[2] for e in state['entries'] if e[0] >= 770 and abs(e[1] - y) <= 8]
+    counts = [v[2] for v in state['labels'] if 490 <= v[0] < 600 and abs(v[1] - y) <= 8]
+    if len(buttons) != 1 or len(entries) != 1 or len(counts) != 1:
+        raise _StorageError(name + u' 줄을 해석할 수 없습니다')
+    button, entry = buttons[0], entries[0]
+    # "수량 입력해 꺼내기"는 1000+10*줄+8, 그 줄의 입력칸은 10+줄. 짝이 맞지 않으면 다른 버튼이다.
+    if button < 1000 or (button - 1000) % 10 != 8 or entry != 10 + (button - 1000) // 10:
+        raise _StorageError(u'인출 버튼 번호가 예상과 다릅니다: %d / %d' % (button, entry))
+    return button, entry, int(counts[0].replace(',', ''))
+
+def BackpackBoards(hue):
+    total = 0
+    for item in SafeGetBackpackContains():
+        try:
+            if item.ItemID == BoardID and item.Hue == hue: total += item.Amount
+        except: pass
+    return total
+
+def SellNpcNearby():
+    npc = Mobiles.FindBySerial(SellNpc) if SellNpc > 0 else None
+    if npc is None: return False
+    pos = Player.Position
+    return max(abs(npc.Position.X - pos.X), abs(npc.Position.Y - pos.Y)) <= SELL_NPC_RANGE
+
+def SellProblem():
+    """판매를 시작할 수 없는 이유. 없으면 빈 문자열."""
+    if SellNpc <= 0: return "판매 NPC를 지정하세요"
+    if not SellNpcNearby(): return "판매 NPC 근처(은행)에서 시작하세요"
+    if not any(SellGrades): return "판매할 등급을 선택하세요"
+    if Player.MaxWeight - Player.Weight - SELL_WEIGHT_MARGIN < 1: return "무게 여유가 없습니다"
+    return ""
+
+def SellPacket(vendor, stacks):
+    """판매 응답 패킷 0x9F: [id][길이 2][상인 4][개수 2] + 개수 × ([물건 4][수량 2]), 빅엔디언.
+    RE 판매 에이전트가 보내는 것과 같은 패킷이라 에이전트 목록 설정 없이 판다."""
+    data = [0x9F, 0, 0] + [(vendor >> s) & 0xFF for s in (24, 16, 8, 0)]
+    data += [(len(stacks) >> 8) & 0xFF, len(stacks) & 0xFF]
+    for serial, amount in stacks:
+        data += [(serial >> s) & 0xFF for s in (24, 16, 8, 0)] + [(amount >> 8) & 0xFF, amount & 0xFF]
+    data[1], data[2] = (len(data) >> 8) & 0xFF, len(data) & 0xFF
+    return data
+
+def _sell_stacks(hue):
+    """가방 최상단의 이 등급 판자 묶음만 판다 (다른 등급·다른 물건은 패킷에 넣지 않음)."""
+    from System import Array, Byte
+    stacks = []
+    for item in SafeGetBackpackContains():
+        try:
+            if item.ItemID == BoardID and item.Hue == hue and item.Amount > 0:
+                stacks.append((int(item.Serial), min(int(item.Amount), 0xFFFF)))
+        except: pass
+    if not stacks: return False
+    PacketLogger.SendToServer(Array[Byte](SellPacket(int(SellNpc), stacks[:99])))  # 서버 한도: 100묶음 미만
+    return True
+
+def _sale_gold(journal):
+    """이 저널 인스턴스에 쌓인 서버 판매 대금 로그 합계."""
+    gold = 0
+    try: rows = journal.GetJournalEntry(-1.0) or []
+    except: return 0
+    for entry in rows:
+        if u'%s' % entry.Type != u'System': continue
+        m = SALE_LOG_RE.match((u'%s' % entry.Text).strip())
+        if m: gold += int(m.group(1).replace(',', ''))
+    return gold
+
+def _sell_backpack(grade, journal, result):
+    """가방의 이 등급 판자를 다 팔 때까지 판매 패킷을 다시 보낸다. 못 팔면 _SellAbort."""
+    hue = BOARD_HUES[grade]
+    idle = 0
+    while BackpackBoards(hue) > 0:
+        if idle >= 3:
+            raise _SellAbort(u"{0} 판매 실패: NPC가 매입하지 않습니다 (판매 NPC·거리 확인)".format(grade))
+        before = BackpackBoards(hue)
+        if journal: journal.Clear()
+        if not _sell_stacks(hue):
+            idle += 1
+            UIPause(500)
+            continue
+        waited = 0
+        while waited < 6000 and BackpackBoards(hue) >= before:
+            UIPause(200); waited += 200
+        sold = before - BackpackBoards(hue)
+        if sold <= 0:
+            idle += 1
+            continue
+        idle = 0
+        gold, waited = 0, 0
+        while journal and waited < 3000:
+            gold = _sale_gold(journal)
+            if gold: break
+            UIPause(200); waited += 200
+        result['sold'] += sold
+        if gold: result['gold'] += gold
+        else: result['missing'] += sold
+        DrawSell()
+
+def _sell_grade(index, journal):
+    grade = BOARD_GRADES[index]
+    name = u'판자 (%s)' % grade
+    hue = BOARD_HUES[grade]
+    keep = SellKeep[index]
+    result = sell_results.setdefault(grade, {'sold': 0, 'gold': 0, 'missing': 0, 'left': None})
+    failures = 0
+    plan = None     # 판매량은 처음 읽은 재고로 고정한다 (판매 중 공용 보관함에 들어오는 판자는 쫓지 않음)
+    withdrawn = 0
+    while True:
+        # 가방의 같은 등급 판자(지난 묶음 늦게 도착분·개인 소지분)부터 판다.
+        _sell_backpack(grade, journal, result)
+        if sell_stop: return
+        try:
+            state = _storage_search(name)
+            row = _storage_row(state, name)
+            stock = row[2] if row else 0
+            result['left'] = stock
+            # 목표: 시작 재고 − 남길 수량. 매 묶음 재고를 다시 읽어 남길 수량 아래로는 절대 꺼내지 않는다.
+            if plan is None: plan = max(0, stock - keep)
+            need = min(plan - withdrawn, stock - keep)
+            if need <= 0: return
+            free = Player.MaxWeight - Player.Weight - SELL_WEIGHT_MARGIN
+            amount = min(SELL_BATCH_MAX, need, free * BOARDS_PER_STONE)
+            if amount < 1: raise _SellAbort(u'무게 여유가 없습니다')
+            state = _storage_reply(row[0], u'인출', search=name, entry=row[1], amount=amount)
+            expected = u'%s %d개를 꺼냈습니다.' % (name, amount)
+            took = expected in [v.replace(',', '') for v in _storage_result(state)]
+            if took: result['left'] = stock - amount
+            Gumps.CloseGump(MARGO_STORAGE_GUMP_ID)
+            waited = 0
+            while waited < 3000 and BackpackBoards(hue) < amount:
+                UIPause(200); waited += 200
+            if not took and BackpackBoards(hue) <= 0:
+                raise _StorageError(u'인출을 확인하지 못했습니다: ' + u' '.join(_storage_result(state)))
+            withdrawn += amount
+            failures = 0
+            sell_notice_set(u'{0} {1:,}개 판매 중 (재고 {2:,} → 목표 {3:,})'.format(grade, amount, stock, keep))
+        except _StorageError as error:
+            failures += 1
+            try: Gumps.CloseGump(MARGO_STORAGE_GUMP_ID)
+            except: pass
+            if failures >= 3: raise _SellAbort(u'[보관함] %s' % error)
+            UIPause(1000)
+
+def sell_notice_set(text):
+    global sell_notice
+    sell_notice = text
+    Player.HeadMessage(68, text)
+    DrawSell()
+
+def SellReport():
+    if not sell_results: return
+    total = 0
+    lines = []
+    for grade in BOARD_GRADES:
+        r = sell_results.get(grade)
+        if not r: continue
+        gold = SaleGold(grade, r)
+        total += gold
+        left = "-" if r['left'] is None else "{:,}".format(r['left'])
+        lines.append(u"- {0}: {1:,}개 · {2:,}골드{3} · 남은 재고 {4}".format(
+            grade, r['sold'], gold, " (추정 포함)" if r['missing'] else "", left))
+    msg = u"💰 **[판자 판매]** {0} — 총 {1:,}골드 ({2}분)\n".format(Player.Name, total, int(sell_elapsed // 60))
+    SendDiscord(msg + u"\n".join(lines))
+    Player.HeadMessage(68, u"[판자 판매] 총 {0:,}골드".format(total))
+
+def SellSession():
+    global sell_running, sell_stop, sell_results, sell_elapsed, sell_open, is_paused
+    # 판매 뒤에는 은행에 머문다. 대시보드 재개를 누르면 채집으로 돌아간다.
+    is_paused = True
+    sell_open = True
+    problem = SellProblem()
+    if problem:
+        sell_notice_set(problem)
+        DrawDashboard(force=True)
+        return
+    sell_running, sell_stop = True, False
+    sell_results = {}
+    started = time.time()
+    try: journal = _new_journal()
+    except Exception: journal = None   # 로그를 못 읽으면 매입가로 추정
+    try:
+        for index in range(len(BOARD_GRADES)):
+            if sell_stop: break
+            if SellGrades[index]: _sell_grade(index, journal)
+        sell_notice_set(u"판매 중지" if sell_stop else u"판매 완료")
+    except _SellAbort as error:
+        sell_notice_set(u'%s' % error)
+    finally:
+        try: Gumps.CloseGump(MARGO_STORAGE_GUMP_ID)
+        except: pass
+        sell_running = False
+        sell_elapsed = time.time() - started
+        DrawSell()
+        DrawDashboard(force=True)
+    SellReport()
+
+def SelectSellNpc():
+    global SellNpc, is_paused
+    is_paused = True
+    Target.Cancel()
+    serial = Target.PromptTarget("판매 NPC 선택 (ESC: 취소)")
+    npc = Mobiles.FindBySerial(serial) if serial and serial > 0 else None
+    if npc:
+        SellNpc = serial
+        SaveSettings()
+        sell_notice_set(u'판매 NPC: %s' % (npc.Name or "0x{:08X}".format(serial)))
+    else:
+        sell_notice_set(u'선택 취소: 기존 지정 유지')
+    DrawDashboard(force=True)
 
 # -----------------------------------------------------------------------------
 # [7] 귀환 및 채집 로직
@@ -1383,8 +1864,12 @@ def RunHarvest():
         UIPause(500)
 
 def RunLumber():
-    global settings_open, settings_notice
+    global settings_open, settings_notice, is_paused
     config_ok = load_json_logic()
+    if config_ok and SellNpcNearby():
+        # 은행의 판매 NPC 옆에서 시작하면 바로 귀환하지 않고 판매할 수 있게 멈춰 둔다.
+        is_paused = True
+        Player.HeadMessage(68, "판매 NPC 근처: 일시정지로 시작 (판자 판매 / 재개)")
     DrawDashboard(force=True)
     if not config_ok:
         settings_notice = "설정을 읽지 못했습니다. 재지정해 주세요"
@@ -1393,6 +1878,10 @@ def RunLumber():
     needs_setup = not config_ok or bool(MissingSettings()) or settings_dirty
     while True:
         try:
+            if action in (SELL_NPC_BID, SELL_START_BID):
+                if action == SELL_NPC_BID: SelectSellNpc()
+                else: SellSession()
+                action = -1
             if needs_setup or action > 1:
                 SettingsSession(action)
                 needs_setup = False
@@ -1421,6 +1910,7 @@ while _restart_count <= WATCHDOG_MAX_RESTARTS:
         Gumps.CloseGump(DASHBOARD_GUMP_ID)
         Gumps.CloseGump(SETTINGS_GUMP_ID)
         Gumps.CloseGump(DETAIL_GUMP_ID)
+        Gumps.CloseGump(SELL_GUMP_ID)
         RunLumber()
         break
 
@@ -1453,6 +1943,7 @@ while _restart_count <= WATCHDOG_MAX_RESTARTS:
         Gumps.CloseGump(DASHBOARD_GUMP_ID)
         Gumps.CloseGump(SETTINGS_GUMP_ID)
         Gumps.CloseGump(DETAIL_GUMP_ID)
+        Gumps.CloseGump(SELL_GUMP_ID)
 
     if _restart_count >= WATCHDOG_MAX_RESTARTS:
         try: Player.HeadMessage(33, "[워치독] 재시작 한도({0}회) 초과. 스크립트를 종료합니다.".format(WATCHDOG_MAX_RESTARTS))
