@@ -2,7 +2,7 @@
 
 
 # =============================================================================
-# [GGO Project] 바울 럼버 인핸스 (Baul Lumber Enhance) v2.1
+# [GGO Project] 바울 럼버 인핸스 (Baul Lumber Enhance) v2.2
 # =============================================================================
 #
 # 원작자의 소중한 소스코드를 기반으로 GGO Project에서 기능적인 개선을 완료한 버전입니다.
@@ -10,7 +10,7 @@
 
 SCRIPT_ID = "GGO_LUMBER"
 SCRIPT_NAME = "GGO_바울럼버인핸스"
-CURRENT_VERSION = "2.1"
+CURRENT_VERSION = "2.2"
 
 import os
 import sys
@@ -518,15 +518,15 @@ def GGO_RecoverHealth():
             if Player.Poisoned:
                 if USE_MAGERY: # 마제리 Cure
                     if Player.Mana >= 6:
-                        Spells.CastMagery('Cure')
+                        WaitCastRecovery(); Spells.CastMagery('Cure')
                         UIWaitForTarget(2000, False)
-                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); UIPause(1200)
+                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); MarkCastEnd(); UIPause(1200)
                     else: UIPause(2000)
                 else: # 기사도 Cleanse by Fire
                     if Player.Mana >= 10:
-                        Spells.CastChivalry('Cleanse by Fire')
+                        WaitCastRecovery(); Spells.CastChivalry('Cleanse by Fire')
                         UIWaitForTarget(2000, False)
-                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); UIPause(1200)
+                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); MarkCastEnd(); UIPause(1200)
                     else: UIPause(2000)
                 continue
 
@@ -534,16 +534,16 @@ def GGO_RecoverHealth():
             if Player.Hits < Player.HitsMax * 0.8:
                 if USE_MAGERY: # 마제리 Greater Heal
                     if Player.Mana >= 11:
-                        Spells.CastMagery('Greater Heal')
+                        WaitCastRecovery(); Spells.CastMagery('Greater Heal')
                         UIWaitForTarget(2000, False)
-                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); UIPause(1200)
+                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); MarkCastEnd(); UIPause(1200)
                     else:
                         Player.HeadMessage(33, "마나 회복 대기 중..."); UIPause(3000)
                 else: # 기사도 Close Wounds
                     if Player.Mana >= 10:
-                        Spells.CastChivalry('Close Wounds')
+                        WaitCastRecovery(); Spells.CastChivalry('Close Wounds')
                         UIWaitForTarget(2000, False)
-                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); UIPause(1200)
+                        if Target.HasTarget(): Target.TargetExecute(Player.Serial); MarkCastEnd(); UIPause(1200)
                     else:
                         Player.HeadMessage(33, "마나/십일조 회복 대기 중..."); UIPause(3000)
 
@@ -1246,6 +1246,31 @@ def EquipAfterTravel():
 # 직전 시전 직후라 시전이 거부된 경우 (cliloc 502644 / 502642, 영문·한글)
 SPELL_RECOVERY_TEXTS = ("not yet recovered", "회복하지 못했습니다", "already casting", "이미 주문을 시전")
 
+# 주문 회복 대기 (ServUO Spell.GetCastRecovery): (기준 − FCR) ÷ 4초, 메져리 6 / 기사도 7.
+# FCR을 안 맞춘 캐릭터가 연속 시전에서 거부되지 않게, 남은 회복 시간만큼만 기다린다.
+last_cast_end = 0.0
+
+def CastRecoverySeconds():
+    """서버 상태 정보(최대무게가 같은 정보에 들어 있음)를 받은 뒤에만 FCR을 믿는다. 아니면 None.
+    시전 때마다 새로 읽어 접속 직후 오인식·장비 변경을 바로 따라간다."""
+    try:
+        if Player.MaxWeight <= 0: return None
+        fcr = max(0, int(Player.FasterCastRecovery))
+    except Exception:
+        return None
+    return max(0, (6 if USE_MAGERY else 7) - fcr) / 4.0
+
+def MarkCastEnd():
+    global last_cast_end
+    last_cast_end = time.time()
+
+def WaitCastRecovery():
+    """직전 시전 뒤 회복 시간이 아직 남았을 때만 기다린다 (평소 이동·회복 완료 후에는 대기 없음)."""
+    recovery = CastRecoverySeconds()
+    if recovery is None or not last_cast_end: return
+    remaining = recovery - (time.time() - last_cast_end)
+    if remaining > 0: UIPause(int(remaining * 1000) + 50)
+
 def TravelBook(book, rune_index, bod=False):
     ServiceUI()
     UnequipForTravel()
@@ -1261,16 +1286,20 @@ def TravelBook(book, rune_index, bod=False):
                 Gumps.CloseGump(0x59)
                 Items.UseItem(book)
                 if not UIWaitForGump(0x59, 5000): return False
+            WaitCastRecovery()
             Journal.Clear()
             # ServUO: 50..65=Recall / 75..90=Sacred Journey (0-based rune index)
             Gumps.SendAction(0x59, (50 if USE_MAGERY else 75) + rune_index)
             # BOD 이동은 상인 앞 안정화를 위해 4초를 채우고, 일반 이동은 도착 즉시 진행한다.
-            limit, waited, refused = (4000 if bod else 5000), 0, False
+            limit, waited, refused, arrived = (4000 if bod else 5000), 0, False, False
             while waited < limit:
                 if any(Journal.Search(text) for text in SPELL_RECOVERY_TEXTS):
                     refused = True
                     break
-                if not bod and moved(): break
+                if not arrived and moved():
+                    arrived = True
+                    MarkCastEnd()  # 회복 시간은 이동을 확인한 순간부터 센다 (실제보다 늦게 = 넉넉하게)
+                    if not bod: break
                 UIPause(250)
                 waited += 250
             if refused and attempt < 2:
@@ -1668,6 +1697,7 @@ def weighthome(force=False):
             ServiceUI()
             UnequipForTravel()
             try:
+                WaitCastRecovery()
                 if USE_MAGERY: Spells.CastMagery('Recall')
                 else: Spells.CastChivalry('Sacred Journey')
                 UIWaitForTarget(4500)
@@ -1680,6 +1710,7 @@ def weighthome(force=False):
             while Player.Position.X == StartX and Player.Position.Y == StartY and wait_time < 5000:
                 UIPause(250)
                 wait_time += 250
+            if Player.Position.X != StartX or Player.Position.Y != StartY: MarkCastEnd()
 
             box_item = Items.FindBySerial(Treecontainer)
             if box_item is not None and box_item.Position is not None and abs(Player.Position.X - box_item.Position.X) <= 3 and abs(Player.Position.Y - box_item.Position.Y) <= 3:

@@ -32,19 +32,19 @@
       "id": "GGO_LUMBER",
       "name": "GGO_바울럼버인핸스",
       "local_file": "GGO_바울럼버인핸스.py",
-      "version": "2.1",
+      "version": "2.2",
       "managed": true,
       "url": "https://raw.githubusercontent.com/gu2tarman/GGO-Scripts/main/%EB%B0%B0%ED%8F%AC/latest/GGO_%EB%B0%94%EC%9A%B8%EB%9F%BC%EB%B2%84%EC%9D%B8%ED%95%B8%EC%8A%A4.py",
-      "notes": "판자 판매(은행 보관함에서 무게 한도만큼 꺼내 NPC 판매 반복, 등급별 판매·남길 수량, 수익 집계), 룬북 이동 실패 무한 반복 수정, 피나무·서리나무 매입가 수정"
+      "notes": "판자 판매·주문 회복 대기·룬북 반복 수정 / 2.0부터: 용병 모드, BOD 타이머, 보관함 통계"
     },
     {
       "id": "GGO_MINING",
       "name": "GGO_바울마이닝인핸스",
       "local_file": "GGO_바울마이닝인핸스.py",
-      "version": "1.9.1",
+      "version": "1.9.2",
       "managed": true,
       "url": "https://raw.githubusercontent.com/gu2tarman/GGO-Scripts/main/%EB%B0%B0%ED%8F%AC/latest/GGO_%EB%B0%94%EC%9A%B8%EB%A7%88%EC%9D%B4%EB%8B%9D%EC%9D%B8%ED%95%B8%EC%8A%A4.py",
-      "notes": "룬북 이동 실패 무한 반복 수정 (남아 있는 룬북 창을 닫고 연다)"
+      "notes": "주문 회복 대기·룬북 반복 수정 / 1.9부터: 용병 모드, 보관함 정리, BOD 타이머, 골드 통계"
     },
     {
       "id": "GGO_RECALL_FISHING",
